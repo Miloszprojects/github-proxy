@@ -22,3 +22,15 @@ The application uses a single configuration property:
 
 ```properties
 github.base-url=https://api.github.com
+```
+---
+##  Maintainer
+
+**Milosz Podsiadly**  
+📧 [m.podsiadly99@gmail.com](mailto:m.podsiadly99@gmail.com)  
+🔗 [GitHub – MiloszPodsiadly](https://github.com/MiloszPodsiadly)
+
+---
+## License
+
+Licensed under the [MIT License](https://opensource.org/licenses/MIT).
