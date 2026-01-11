@@ -27,6 +27,7 @@ dependencies {
     testImplementation 'org.assertj:assertj-core'
     testImplementation 'org.wiremock:wiremock-standalone:3.13.2'
     testImplementation 'com.fasterxml.jackson.core:jackson-databind'
+    testImplementation 'org.apache.commons:commons-lang3:3.20.0'
 
     testRuntimeOnly 'org.junit.platform:junit-platform-launcher'
 }
