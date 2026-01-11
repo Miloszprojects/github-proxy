@@ -3,6 +3,8 @@ package com.miloszpodsiadly.githubproxy;
 import org.springframework.stereotype.Service;
 
 import java.util.List;
+import java.util.concurrent.CompletableFuture;
+import java.util.concurrent.Executors;
 
 @Service
 class GithubService {
@@ -16,19 +18,32 @@ class GithubService {
     List<RepositoryResponse> getRepositories(String username) {
         var repos = client.getRepositories(username);
 
-        return repos.stream()
-                .filter(repo -> !repo.fork())
-                .map(repo -> {
-                    var owner = repo.owner().login();
-                    var branches = client.getBranches(owner, repo.name());
-                    return new RepositoryResponse(
-                            repo.name(),
-                            owner,
-                            branches
-                    );
-                })
-                .toList();
+        try (var executor = Executors.newVirtualThreadPerTaskExecutor()) {
+            var tasks = repos.stream()
+                    .filter(repo -> !repo.fork())
+                    .map(repo -> {
+                        var owner = repo.owner().login();
+                        var branchesFuture = CompletableFuture.supplyAsync(
+                                () -> client.getBranches(owner, repo.name()),
+                                executor
+                        );
+                        return new RepoTask(repo.name(), owner, branchesFuture);
+                    })
+                    .toList();
+
+            return tasks.stream()
+                    .map(t -> new RepositoryResponse(
+                            t.repoName(),
+                            t.ownerLogin(),
+                            t.branchesFuture().join()
+                    ))
+                    .toList();
+        }
     }
+
+    private record RepoTask(
+            String repoName,
+            String ownerLogin,
+            CompletableFuture<List<Branch>> branchesFuture
+    ) {}
 }
-
-
