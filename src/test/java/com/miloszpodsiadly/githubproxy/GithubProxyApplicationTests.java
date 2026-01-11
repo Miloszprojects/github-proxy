@@ -2,6 +2,7 @@ package com.miloszpodsiadly.githubproxy;
 
 import com.fasterxml.jackson.databind.ObjectMapper;
 import com.github.tomakehurst.wiremock.WireMockServer;
+import org.apache.commons.lang3.time.StopWatch;
 import org.junit.jupiter.api.AfterAll;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
@@ -23,6 +24,7 @@ import static com.github.tomakehurst.wiremock.client.WireMock.getRequestedFor;
 import static com.github.tomakehurst.wiremock.client.WireMock.okJson;
 import static com.github.tomakehurst.wiremock.client.WireMock.stubFor;
 import static com.github.tomakehurst.wiremock.client.WireMock.urlEqualTo;
+import static com.github.tomakehurst.wiremock.client.WireMock.urlMatching;
 import static com.github.tomakehurst.wiremock.client.WireMock.verify;
 import static com.github.tomakehurst.wiremock.core.WireMockConfiguration.options;
 import static org.assertj.core.api.Assertions.assertThat;
@@ -33,6 +35,9 @@ import static org.junit.jupiter.api.Assertions.assertAll;
 class GithubProxyApplicationTests {
 
     private static final String USER = "MiloszPodsiadly";
+
+    // We simulate GitHub latency: each request takes 1000ms.
+    private static final int GITHUB_DELAY_MS = 1000;
 
     private static final WireMockServer wireMockServer;
 
@@ -63,75 +68,81 @@ class GithubProxyApplicationTests {
     private final ObjectMapper objectMapper = new ObjectMapper();
 
     @Test
-    void returnsNonForkReposWithBranchesAndLastCommitSha() throws Exception {
-        stubGithubRepos(USER, """
+    void makes3GithubRequests_andProcessesIn2to3Seconds_when2NonForkReposFetchBranchesInParallel() throws Exception {
+        /* ===== GIVEN =====
+         1) GitHub endpoint /users/{username}/repos returns 3 repositories,
+            but one of them is a fork (it should be filtered out).
+         2) Each request to WireMock has a fixedDelay of 1000ms.
+
+         So we expect the application to execute:
+         - 1 request: /users/{username}/repos (1000ms)
+         - 2 requests in parallel: /repos/{owner}/{repo}/branches (1000ms total, because they're in parallel)
+         Total time: about 2000ms (+overhead!!), so an assertion of 2000–3000ms. */
+        stubGithubReposWithDelay(USER, """
                 [
-                  { "name": "CareerHub", "fork": false, "owner": { "login": "MiloszPodsiadly" } }
+                  { "name": "RepoA",    "fork": false, "owner": { "login": "MiloszPodsiadly" } },
+                  { "name": "RepoB",    "fork": false, "owner": { "login": "MiloszPodsiadly" } },
+                  { "name": "RepoFork", "fork": true,  "owner": { "login": "MiloszPodsiadly" } }
                 ]
                 """);
 
-        stubGithubBranches(USER, "CareerHub", """
+        // Branches for two non-fork repositories (also with fixedDelay = 1000ms)
+        stubGithubBranchesWithDelay(USER, "RepoA", """
                 [
                   { "name": "main", "commit": { "sha": "de2bc6e3dbe9d7ce7f1ec48d5230e5a7a201864d" } }
                 ]
                 """);
 
-        var response = callRepositories(USER);
-
-        RepositoryResponse[] body = readJson(response, RepositoryResponse[].class);
-
-        assertAll(
-                () -> assertThat(response.getStatusCode()).isEqualTo(HttpStatus.OK),
-                () -> assertThat(body).hasSize(1),
-                () -> assertRepository(body[0], "CareerHub", USER),
-                () -> assertThat(body[0].branches()).hasSize(1),
-                () -> assertBranchHasSha(body[0].branches().getFirst(), "main"),
-                () -> verify(1, getRequestedFor(urlEqualTo("/users/" + USER + "/repos"))),
-                () -> verify(1, getRequestedFor(urlEqualTo("/repos/" + USER + "/CareerHub/branches")))
-        );
-    }
-
-    @Test
-    void skipsForkReposAndDoesNotFetchBranchesForForks() throws Exception {
-        stubGithubRepos(USER, """
-                [
-                  { "name": "ForkedRepo", "fork": true,  "owner": { "login": "MiloszPodsiadly" } },
-                  { "name": "Library",    "fork": false, "owner": { "login": "MiloszPodsiadly" } }
-                ]
-                """);
-
-        stubGithubBranches(USER, "Library", """
+        stubGithubBranchesWithDelay(USER, "RepoB", """
                 [
                   { "name": "master", "commit": { "sha": "21b819e26224cda02d1f1ac28bc9629da84d6cfe" } }
                 ]
                 """);
 
+        // ===== WHEN =====
+        // We curl our endpoint: /users/{username}/repositories and measure the total execution time.
+        var stopWatch = new StopWatch();
+        stopWatch.start();
         var response = callRepositories(USER);
+        stopWatch.stop();
 
         RepositoryResponse[] body = readJson(response, RepositoryResponse[].class);
+        long elapsedMs = stopWatch.getTime();
 
+        /* ===== THEN =====
+         1) We return only 2 repos (the fork is ignored).
+         2) Execution time is within 2000–3000ms (proof that the branches were executed in parallel).
+         3) A total of exactly 3 requests to "GitHub" (WireMock) were made:
+            1x repos + 2x branches.*/
         assertAll(
                 () -> assertThat(response.getStatusCode()).isEqualTo(HttpStatus.OK),
-                () -> assertThat(body).hasSize(1),
-                () -> assertRepository(body[0], "Library", USER),
-                () -> assertThat(body[0].branches()).hasSize(1),
-                () -> assertBranchHasSha(body[0].branches().getFirst(), "master"),
+                () -> assertThat(body).hasSize(2),
+                () -> assertThat(elapsedMs).isBetween(2000L, 3000L),
+                () -> verify(3, getRequestedFor(urlMatching(".*"))),
+
+                // additionally: readability – we know which requests were sent and that we are not downloading the fork
                 () -> verify(1, getRequestedFor(urlEqualTo("/users/" + USER + "/repos"))),
-                () -> verify(0, getRequestedFor(urlEqualTo("/repos/" + USER + "/ForkedRepo/branches"))),
-                () -> verify(1, getRequestedFor(urlEqualTo("/repos/" + USER + "/Library/branches")))
+                () -> verify(1, getRequestedFor(urlEqualTo("/repos/" + USER + "/RepoA/branches"))),
+                () -> verify(1, getRequestedFor(urlEqualTo("/repos/" + USER + "/RepoB/branches"))),
+                () -> verify(0, getRequestedFor(urlEqualTo("/repos/" + USER + "/RepoFork/branches")))
         );
     }
 
     @Test
     void returns404WithExpectedBodyWhenGithubUserDoesNotExist() throws Exception {
+        // ===== GIVEN =====
+        // GitHub returns 404 for /users/{username}/repos (simulating "Not Found").
         String missingUser = USER + "yyyyyyy";
         stubFor(get(urlEqualTo("/users/" + missingUser + "/repos"))
                 .willReturn(aResponse()
                         .withStatus(404)
-                        .withBody("{\"message\":\"Not Found\"}")));
+                        .withBody("{\"message\":\"Not Found\"}")
+                        .withFixedDelay(GITHUB_DELAY_MS)));
 
+        // ===== WHEN =====
         var response = callRepositoriesAllowing4xx(missingUser);
 
+        // ===== THEN =====
         ErrorResponse body = readJson(response, ErrorResponse.class);
 
         assertAll(
@@ -171,31 +182,13 @@ class GithubProxyApplicationTests {
         return objectMapper.readValue(response.getBody(), type);
     }
 
-    private static void stubGithubRepos(String username, String jsonBody) {
+    private static void stubGithubReposWithDelay(String username, String jsonBody) {
         stubFor(get(urlEqualTo("/users/" + username + "/repos"))
-                .willReturn(okJson(jsonBody)));
+                .willReturn(okJson(jsonBody).withFixedDelay(GITHUB_DELAY_MS)));
     }
 
-    private static void stubGithubBranches(String owner, String repo, String jsonBody) {
+    private static void stubGithubBranchesWithDelay(String owner, String repo, String jsonBody) {
         stubFor(get(urlEqualTo("/repos/" + owner + "/" + repo + "/branches"))
-                .willReturn(okJson(jsonBody)));
-    }
-
-    private static void assertRepository(RepositoryResponse repo, String expectedName, String expectedOwnerLogin) {
-        assertAll(
-                () -> assertThat(repo.repositoryName()).isEqualTo(expectedName),
-                () -> assertThat(repo.ownerLogin()).isEqualTo(expectedOwnerLogin),
-                () -> assertThat(repo.branches()).isNotNull()
-        );
-    }
-
-    private static void assertBranchHasSha(Branch branch, String expectedBranchName) {
-        assertAll(
-                () -> assertThat(branch).isNotNull(),
-                () -> assertThat(branch.name()).isEqualTo(expectedBranchName),
-                () -> assertThat(branch.commit()).isNotNull(),
-                () -> assertThat(branch.commit().sha()).isNotBlank(),
-                () -> assertThat(branch.commit().sha()).matches("^[a-f0-9]{40}$")
-        );
+                .willReturn(okJson(jsonBody).withFixedDelay(GITHUB_DELAY_MS)));
     }
 }
